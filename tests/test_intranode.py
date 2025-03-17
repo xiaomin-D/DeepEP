@@ -1,3 +1,7 @@
+"""
+单个节点内, 多个GPU之间的测试
+
+"""
 import os
 import time
 import torch
@@ -19,21 +23,36 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk={num_topk}', flush=True)
 
     # Random data
+    # x形状为(num_tokens, hidden)，数据类型为bfloat16，设备为当前gpu cuda，数据值为rank
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
+    # x_pure_rand形状为(num_tokens, hidden)，数据类型为bfloat16，设备为当前gpu cuda，数据值为随机值
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+    # x_e4m3形状为(num_tokens, hidden)，数据类型为fp8，设备为当前gpu cuda，数据值为x的fp8值
     x_e4m3 = per_token_cast_to_fp8(x)
+    # scores形状为(num_tokens, num_experts)，数据类型为float32，设备为当前gpu cuda，数据值为随机值
+    # scores是指每个token在每个专家上的得分，因此scores的形状为(num_tokens, num_experts)
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # topk_idx形状为(num_tokens, num_topk)，数据类型为long，设备为当前gpu cuda，数据值为scores中最大的num_topk个值的索引
+    # 这里使用torch.topk函数，返回scores中最大的num_topk个值的索引
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # topk_weights形状为(num_tokens, num_topk)，数据类型为float32，设备为当前gpu cuda，数据值为1
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
+    # topk_weights_pure_rand形状为(num_tokens, num_topk)，数据类型为float32，设备为当前gpu cuda，数据值为随机值
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    # rank_idx形状为(num_tokens, num_topk)，数据类型为long，设备为cuda，数据值为topk_idx除以(num_experts // num_ranks)的商
+    # 这里将topk_idx除以(num_experts // num_ranks)的商，将每个token的topk_idx映射到对应的rank
     rank_idx = topk_idx // (num_experts // num_ranks)
+    # 如果topk_idx为-1，则rank_idx为-1
     rank_idx.masked_fill_(topk_idx == -1, -1)
+    # 对rank_idx进行去重，并限制在num_ranks范围内
     inplace_unique(rank_idx, num_ranks)
 
     # Expert meta
+    # 根据topk_idx，计算每个专家的token数量
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
+    # 将每个专家的token数量进行广播
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
@@ -51,12 +70,14 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
     is_token_in_rank = token_idx_in_rank >= 0
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
-
+    # 获取dispatch布局
     ref_num_tokens_per_rank, _, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
+    # 检查dispatch布局是否正确
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
+    # 计算获取dispatch布局的时间
     t = bench(lambda: buffer.get_dispatch_layout(topk_idx, num_experts))[0]
     if local_rank == 0:
         print(f'[layout] Kernel performance: {t * 1000:.3f} ms', flush=True)
@@ -197,16 +218,19 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
+    # 初始化分布式环境，获取当前进程的rank和进程组
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    # 测试低延迟兼容性，并计算RDMA字节数
     test_ll_compatibility, num_rdma_bytes = False, 0
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
         num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(ll_num_tokens, ll_hidden, num_ranks, ll_num_experts)
 
+    # 创建缓冲区对象，设置缓冲区大小、RDMA字节数、低延迟模式和每个进程的QPS数
     buffer = deep_ep.Buffer(group, int(1e9), num_rdma_bytes, low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
     torch.manual_seed(rank)
-
+    # 24个sm，local_rank为当前局部rank，num_ranks为全局rank数，rank为当前进程的rank，buffer为缓冲区对象，group为进程组
     for i in (24, ):
         test_main(i, local_rank, num_ranks, rank, buffer, group)
         if local_rank == 0:
